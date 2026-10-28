@@ -530,7 +530,7 @@ impl App {
             let options = [
                 (Fullscreen::Normal.label(), "No change."),
                 (Fullscreen::Slow.label(), "Every 20 s; may connect slower."),
-                (Fullscreen::Pause.label(), "Paused until you leave the game."),
+                (Fullscreen::Pause.label(), "App stops; Windows may still reconnect."),
             ];
             if let Some(i) = dropdown(ui, "During fullscreen games", current, &options) {
                 let mode = Fullscreen::ALL[i] as u8;

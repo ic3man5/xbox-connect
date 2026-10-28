@@ -88,7 +88,13 @@ fn run(addr: u64, label: &str, want: &AtomicBool, slow: bool, shared: &Shared) {
     while want.load(Ordering::Relaxed) {
         if dev.ConnectionStatus().is_ok_and(|s| s == BluetoothConnectionStatus::Connected) {
             let secs = started.elapsed().as_secs();
-            events::log(format!("{label}: reconnected after {secs}s ({tries} attempts)"));
+            // With no attempt of ours made (e.g. paused while gaming), Windows' own background
+            // reconnect did it through the keeper's MaintainConnection session; say so.
+            events::log(if tries == 0 {
+                format!("{label}: reconnected by Windows on its own after {secs}s")
+            } else {
+                format!("{label}: reconnected after {secs}s ({tries} attempts)")
+            });
             break;
         }
 

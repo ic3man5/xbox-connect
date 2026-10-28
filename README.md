@@ -16,6 +16,8 @@ Xbox Connect does what Linux does: while a controller is missing it **keeps a co
 - **Pair / re-pair** from the app: press the controller's pair button and the app does the rest. An existing pairing is only replaced once the controller is actually in pairing mode, so cancelling never leaves you worse off.
 - **During fullscreen games** setting: keep reconnecting, slow down (one try every 20 s, so the shared Wi-Fi/Bluetooth radio stays free; a controller switched on mid-game may take longer), or pause the app's own attempts until you leave the game (Windows' slower built-in reconnect may still pick the controller up). "Fullscreen" is what Windows reports for its own notifications: games in exclusive or borderless fullscreen on the main display, and also fullscreen video or presentations.
 - **Events** tab with the connection history, also written to `%LOCALAPPDATA%\XboxConnect\events.log` (rolled over to `events.old.log` at 256 KB). Attach it to bug reports.
+
+  ![Events tab](docs/events.png)
 - Battery percentage straight from the controller (Bluetooth GATT), plus firmware version.
 - Live input view: sticks, triggers (analog), bumpers, D-pad, ABXY, View/Menu/Share, Guide, and Elite paddles.
 - System tray icon (cyan when connected) with a battery tooltip. Closing the window keeps it running in the tray.

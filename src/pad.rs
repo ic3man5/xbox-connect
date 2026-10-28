@@ -324,7 +324,10 @@ pub fn spawn_poller(
             if !same(&last, &p) {
                 *crate::bt::lock(&slot) = p.clone();
                 last = p;
-                ctx.request_repaint();
+                // The Events tab doesn't show the controller; its 1 s refresh is enough there.
+                if !shared.events_tab.load(std::sync::atomic::Ordering::Relaxed) {
+                    ctx.request_repaint();
+                }
             }
             std::thread::sleep(Duration::from_millis(8));
         }

@@ -22,7 +22,10 @@ jobs:
         shell: pwsh
         run: |
           rustup toolchain install
-          rustup component add clippy
+          rustup component add clippy rustfmt
+
+      - name: Format
+        run: cargo fmt --check
 
       - name: Lint
         run: cargo clippy --release --locked -- -D warnings

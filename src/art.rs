@@ -501,9 +501,13 @@ impl Art {
     }
 }
 
-/// Silhouette alpha for icons, `size`×`size`, from a 4x raster of the drawing.
+/// Silhouette alpha for icons, `size`×`size`. The outline is rasterised at >= 512 px so its thin
+/// strokes stay closed (at small rasters gaps let the outside fill leak in and erase the body),
+/// then box-filtered down.
 pub fn silhouette(size: u32) -> Vec<u8> {
-    let big = size as usize * 4;
+    let s = size as usize;
+    let k = 512usize.div_ceil(s).max(4); // supersampling factor per output pixel
+    let big = s * k;
     let scale = big as f32 / ART_W;
     let (w, h) = (big, big);
     let lines = rasterize(scale, w, h);
@@ -519,20 +523,19 @@ pub fn silhouette(size: u32) -> Vec<u8> {
     let outside = flood(&lines, w, h, &border);
     // Centre the shorter drawing vertically in the square.
     let off = ((ART_W - ART_H) / 2.0 * scale) as isize;
-    let s = size as usize;
     let mut out = vec![0u8; s * s];
     for y in 0..s {
         for x in 0..s {
-            let mut n = 0u32;
-            for sy in 0..4 {
-                for sx in 0..4 {
-                    let (bx, by) = (x * 4 + sx, (y * 4 + sy) as isize - off);
+            let mut n = 0usize;
+            for sy in 0..k {
+                for sx in 0..k {
+                    let (bx, by) = (x * k + sx, (y * k + sy) as isize - off);
                     if by >= 0 && (by as usize) < h && !outside[by as usize * w + bx] {
                         n += 1;
                     }
                 }
             }
-            out[y * s + x] = (n * 255 / 16) as u8;
+            out[y * s + x] = (n * 255 / (k * k)) as u8;
         }
     }
     out

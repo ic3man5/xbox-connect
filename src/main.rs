@@ -1,11 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod adv;
 mod art;
 mod bt;
 mod draw;
+mod events;
 mod host;
 mod icon;
 mod pad;
+mod pair;
+mod reconnect;
 mod settings;
 mod theme;
 mod tray;
@@ -26,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, w};
 
-use bt::{CtrlInfo, Link, Shared, format_address};
+use bt::{CtrlInfo, Link, Repair, Shared, format_address};
 use theme::*;
 pub const APP_NAME: &str = "Xbox Connect";
 
@@ -152,28 +156,55 @@ fn main() {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Input,
+    Events,
+}
+
 pub struct App {
     shared: Arc<Shared>,
     pad: Arc<std::sync::Mutex<pad::Pad>>,
     demo: Option<std::time::Instant>,
     canvas: draw::Canvas,
     selected: usize,
+    tab: Tab,
+    /// Jump the Events list to its newest line on the next frame (set when the tab is opened).
+    scroll_events: bool,
+    /// First click on a re-pair control arms it for a few seconds; the second one starts it.
+    confirm_repair: Option<(u64, std::time::Instant)>,
+    /// The address of the last pairing job started (0 = any controller), for "Try again".
+    last_repair: u64,
+    /// The window is visible and not minimised this frame (animations only run then).
+    shown: bool,
 }
 
 impl App {
     fn new(shared: Arc<Shared>, ctx: egui::Context) -> Self {
         let demo = std::env::args().any(|a| a == "--demo").then(std::time::Instant::now);
         let pad = pad::spawn_poller(ctx, shared.clone());
-        Self { shared, pad, demo, canvas: draw::Canvas::default(), selected: 0 }
+        Self {
+            shared,
+            pad,
+            demo,
+            canvas: draw::Canvas::default(),
+            selected: 0,
+            tab: Tab::Input,
+            scroll_events: false,
+            confirm_repair: None,
+            last_repair: 0,
+            shown: false,
+        }
     }
 
     fn raw_hwnd(&self) -> HWND {
         hwnd(self.shared.hwnd.load(Ordering::Relaxed))
     }
 }
-fn link_style(link: Link) -> (&'static str, egui::Color32) {
-    match link {
+fn link_style(c: &CtrlInfo) -> (&'static str, egui::Color32) {
+    match c.link {
         Link::Connected => ("LINKED", OK),
+        _ if c.pairing_lost => ("PAIRING LOST", BAD),
         Link::Disconnected => ("OFFLINE", WARN),
         Link::Connecting => ("CONNECTING", ACCENT),
     }
@@ -184,6 +215,7 @@ impl App {
     pub fn ui(&mut self, ctx: &egui::Context) {
         let ctx = ctx.clone();
         let visible = unsafe { IsWindowVisible(self.raw_hwnd()).as_bool() };
+        self.shown = visible && !unsafe { IsIconic(self.raw_hwnd()).as_bool() };
 
         let pad = match self.demo {
             Some(t0) => pad::demo(t0.elapsed().as_secs_f32()),
@@ -198,6 +230,7 @@ impl App {
                 link: Link::Connected,
                 battery: Some(82),
                 firmware: Some("5.23.6.0".into()),
+                pairing_lost: false,
             }]
         } else {
             self.shared.snapshot()
@@ -269,13 +302,11 @@ impl App {
                     }
                     y += step;
                 }
-                ui.horizontal(|ui| {
-                    ui.label(hud("Live input", 11.0, MUTED));
-                    if pad.connected {
-                        ui.label(hud(&format!("· {}", pad.name), 11.0, ACCENT));
-                    }
-                });
-                draw::controller(ui, &pad, live, &mut self.canvas);
+                self.tab_bar(ui, &pad);
+                match self.tab {
+                    Tab::Input => draw::controller(ui, &pad, live, &mut self.canvas),
+                    Tab::Events => events_view(ui, &mut self.scroll_events, ctrls.len() <= 1),
+                }
             },
         );
 
@@ -298,15 +329,16 @@ impl App {
                 ui.label(RichText::new(err).color(BAD));
             });
         }
+        self.repair_card(ui);
 
         if ctrls.len() > 1 {
             ui.horizontal_wrapped(|ui| {
                 for (i, c) in ctrls.iter().enumerate() {
-                    let (_, col) = link_style(c.link);
+                    let (_, col) = link_style(c);
                     let batt = c.battery.map_or(String::new(), |b| format!(" {b}%"));
                     let text = hud(&format!("● {}{batt}", i + 1), 11.0, if i == self.selected { BG } else { col });
                     let b = egui::Button::new(text).fill(if i == self.selected { ACCENT } else { CARD });
-                    let tip = format!("{}\n{}\n{}", c.name, format_address(c.address), link_style(c.link).0);
+                    let tip = format!("{}\n{}\n{}", c.name, format_address(c.address), link_style(c).0);
                     if ui.add(b).on_hover_text(tip).clicked() {
                         self.selected = i;
                     }
@@ -319,13 +351,19 @@ impl App {
                 let scanned = self.shared.scanned.load(Ordering::Relaxed);
                 ui.label(hud(if scanned { "No controller paired" } else { "Scanning…" }, 12.0, WARN));
                 ui.label(
-                    RichText::new("Hold the pair button on the controller, then add it in Bluetooth settings.")
+                    RichText::new("Hold the pair button on top of the controller until the light flashes fast.")
                         .color(MUTED)
                         .size(12.0),
                 );
+                if scanned && !self.repair_busy() {
+                    ui.add_space(6.0);
+                    if action_button(ui, "Pair a controller", false).clicked() {
+                        self.start_repair(0);
+                    }
+                }
             }),
             Some(c) => {
-                let (status, col) = link_style(c.link);
+                let (status, col) = link_style(c);
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
@@ -336,6 +374,43 @@ impl App {
                     ui.label(RichText::new(&c.name).size(18.0).strong());
                     ui.label(hud(&format_address(c.address), 10.0, MUTED));
                     ui.label(hud(&format!("Firmware {}", c.firmware.as_deref().unwrap_or("--")), 10.0, MUTED));
+                    if c.link != Link::Connected && !self.repair_busy() {
+                        let armed = self
+                            .confirm_repair
+                            .is_some_and(|(a, t)| a == c.address && t.elapsed() < Duration::from_secs(4));
+                        ui.add_space(6.0);
+                        let clicked = if c.pairing_lost {
+                            // The pad keeps getting refused: re-pairing is the fix, so offer it plainly.
+                            ui.label(
+                                RichText::new(
+                                    "It reaches this PC but gets refused: the controller has forgotten the pairing.",
+                                )
+                                .color(TEXT)
+                                .size(12.0),
+                            );
+                            ui.add_space(4.0);
+                            action_button(
+                                ui,
+                                if armed { "Click again to re-pair" } else { "Re-pair controller" },
+                                false,
+                            )
+                            .clicked()
+                        } else {
+                            // Usually it's just switched off; keep re-pairing a quiet secondary option.
+                            let text = if armed { "Click again to re-pair" } else { "Won't connect? Re-pair…" };
+                            ui.add(egui::Label::new(hud(text, 10.0, ACCENT)).sense(egui::Sense::click()))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                        };
+                        if clicked {
+                            if armed {
+                                self.confirm_repair = None;
+                                self.start_repair(c.address);
+                            } else {
+                                self.confirm_repair = Some((c.address, std::time::Instant::now()));
+                            }
+                        }
+                    }
                 });
 
                 // Battery: GATT reading; falls back to the input API when there's exactly one pad.
@@ -435,7 +510,11 @@ impl App {
     /// Settings and actions, pinned to the bottom of the side panel so they never scroll away.
     fn side_footer(&mut self, ui: &mut egui::Ui) {
         let mut keep = self.shared.maintain.load(Ordering::Relaxed);
-        if toggle(ui, &mut keep, "Keep connected").changed() {
+        let resp = toggle(ui, &mut keep, "Auto-reconnect").on_hover_text(
+            "Reconnect controllers automatically when they're turned on, and keep them connected.\n\
+             Off: the app only shows status and leaves reconnecting to Windows.",
+        );
+        if resp.changed() {
             self.shared.maintain.store(keep, Ordering::Relaxed);
             settings::set_keep_connected(keep);
         }
@@ -444,15 +523,281 @@ impl App {
             self.shared.autostart.store(auto, Ordering::Relaxed);
         }
         ui.add_space(2.0);
-        if action_button(ui, "Bluetooth settings").clicked() {
+        if action_button(ui, "Bluetooth settings", true).clicked() {
             unsafe { ShellExecuteW(None, w!("open"), w!("ms-settings:bluetooth"), None, None, SW_SHOWNORMAL) };
         }
         ui.label(RichText::new("Closing the window keeps it running in the tray.").size(11.0).color(MUTED));
     }
 }
 
-/// Full-width outlined button with a centred HUD label and an external-link arrow.
-fn action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+impl App {
+    fn repair_busy(&self) -> bool {
+        bt::lock(&self.shared.repair).busy()
+    }
+
+    fn start_repair(&mut self, addr: u64) {
+        let mut r = bt::lock(&self.shared.repair);
+        if !r.busy() {
+            self.last_repair = addr;
+            self.shared.repair_cancel.store(false, Ordering::Relaxed);
+            *r = Repair::Requested(addr);
+        }
+    }
+
+    fn cancel_repair(&self) {
+        let mut r = bt::lock(&self.shared.repair);
+        match *r {
+            // Not picked up yet: nothing has happened, so just withdraw it.
+            Repair::Requested(_) => *r = Repair::Idle,
+            _ => self.shared.repair_cancel.store(true, Ordering::Relaxed),
+        }
+    }
+
+    /// "Live input | Events" tabs on a faint baseline, with the active pad's name at the far end.
+    fn tab_bar(&mut self, ui: &mut egui::Ui, pad: &pad::Pad) {
+        let row = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 18.0;
+            for (tab, name) in [(Tab::Input, "Live input"), (Tab::Events, "Events")] {
+                let on = self.tab == tab;
+                let id = ui.next_auto_id();
+                let hot = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
+                let col = if on {
+                    ACCENT
+                } else if hot {
+                    alpha(ACCENT, 180)
+                } else {
+                    MUTED
+                };
+                let r = ui.add(egui::Label::new(hud(name, 11.0, col)).sense(egui::Sense::click()));
+                if on {
+                    let y = r.rect.bottom() + 6.0;
+                    let (a, b) = (egui::pos2(r.rect.left(), y), egui::pos2(r.rect.right(), y));
+                    ui.painter().line_segment([a, b], Stroke::new(4.0_f32, alpha(ACCENT, 60)));
+                    ui.painter().line_segment([a, b], Stroke::new(2.0_f32, ACCENT));
+                }
+                if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && !on {
+                    self.tab = tab;
+                    self.scroll_events = tab == Tab::Events;
+                    self.shared.events_tab.store(tab == Tab::Events, Ordering::Relaxed);
+                }
+            }
+            if self.tab == Tab::Input && pad.connected {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(hud(&pad.name, 10.0, alpha(ACCENT, 200)));
+                });
+            }
+        });
+        let r = row.response.rect;
+        let y = r.bottom() + 6.0;
+        ui.painter().line_segment(
+            [egui::pos2(r.left(), y), egui::pos2(ui.max_rect().right(), y)],
+            Stroke::new(1.0_f32, alpha(ACCENT, 30)),
+        );
+        ui.add_space(8.0);
+    }
+
+    /// Pairing progress, shown above everything else while it runs (the controller drops out of
+    /// the paired list part-way through a re-pair).
+    fn repair_card(&mut self, ui: &mut egui::Ui) {
+        let state = bt::lock(&self.shared.repair).clone();
+        let (title, col, body) = match &state {
+            Repair::Idle => return,
+            Repair::Requested(_) | Repair::Waiting => (
+                "Waiting for controller",
+                ACCENT,
+                "Hold the small pair button on top of the controller until the Xbox light flashes fast. \
+                 Nothing changes until it does."
+                    .to_string(),
+            ),
+            Repair::Removing => ("Re-pairing", ACCENT, "Controller found. Removing the old pairing…".to_string()),
+            Repair::Pairing => ("Pairing", ACCENT, "Controller found, pairing…".to_string()),
+            Repair::Done => ("Paired", OK, "It will reconnect on its own from now on.".to_string()),
+            Repair::Failed(e) => ("Pairing failed", BAD, e.clone()),
+        };
+        let busy = state.busy();
+        card_outlined(ui, alpha(col, 90), |ui| {
+            ui.label(hud(title, 12.0, col));
+            ui.label(RichText::new(body).color(TEXT).size(12.0));
+            if busy {
+                // Indeterminate sweep in the battery-gauge style, so a long wait never looks frozen.
+                ui.add_space(6.0);
+                let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), egui::Sense::hover());
+                let n = 12;
+                let gap = 3.0;
+                let w = (r.width() - gap * (n as f32 - 1.0)) / n as f32;
+                let head = (ui.input(|i| i.time) * 8.0) as usize % (n + 3);
+                for i in 0..n {
+                    let seg = egui::Rect::from_min_size(
+                        egui::pos2(r.left() + i as f32 * (w + gap), r.top()),
+                        Vec2::new(w, r.height()),
+                    );
+                    let lit = i <= head && head < i + 3;
+                    ui.painter().rect_filled(seg, 2.0, if lit { ACCENT } else { alpha(ACCENT, 35) });
+                }
+                if self.shown {
+                    ui.ctx().request_repaint_after(Duration::from_millis(33));
+                }
+            }
+            ui.add_space(8.0);
+            // After a failure the old pairing may already be gone, so offer the way back here
+            // (the controller may no longer be listed, and "Pair a controller" only shows when none are).
+            if matches!(state, Repair::Failed(_)) && action_button(ui, "Try again", false).clicked() {
+                let addr = self.last_repair;
+                self.start_repair(addr);
+                return;
+            }
+            if secondary_button(ui, if busy { "Cancel" } else { "Dismiss" }).clicked() {
+                if busy {
+                    self.cancel_repair();
+                } else {
+                    *bt::lock(&self.shared.repair) = Repair::Idle;
+                }
+            }
+        });
+    }
+}
+
+/// The connection history (events.log) as a two-column list: time, then the message (wrapped
+/// lines hang under the message). Follows new lines as they arrive; a rule marks each new day.
+fn events_view(ui: &mut egui::Ui, jump_to_end: &mut bool, strip_names: bool) {
+    egui::Frame::new()
+        .fill(alpha(CARD, 220))
+        .stroke(Stroke::new(1.0_f32, alpha(ACCENT, 40)))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(hud("Connection history", 10.0, MUTED));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let open =
+                        ui.add(egui::Label::new(hud("Open log folder ↗", 10.0, ACCENT)).sense(egui::Sense::click()));
+                    if open.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                        && let Some(dir) = log_dir()
+                    {
+                        let dir = windows::core::HSTRING::from(dir.as_os_str());
+                        unsafe { ShellExecuteW(None, w!("open"), &dir, None, None, SW_SHOWNORMAL) };
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            let lines = events::recent();
+            let mono = |s: &str, col| RichText::new(s).family(egui::FontFamily::Monospace).size(11.0).color(col);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                if lines.is_empty() {
+                    ui.label(hud("Nothing yet.", 11.0, MUTED));
+                }
+                let mut day = "";
+                for line in &lines {
+                    // "YYYY-MM-DD HH:MM:SS  message"; anything else is shown whole.
+                    let (date, time, msg) = match (line.get(..10), line.get(11..19), line.get(19..)) {
+                        (Some(d), Some(t), Some(m)) => (d, t, m.trim_start()),
+                        _ => ("", "", line.as_str()),
+                    };
+                    if date != day {
+                        day = date;
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(hud(date, 10.0, MUTED));
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::new(ui.available_width(), 10.0), egui::Sense::hover());
+                            ui.painter().line_segment(
+                                [r.left_center(), r.right_center()],
+                                Stroke::new(1.0_f32, alpha(ACCENT, 30)),
+                            );
+                        });
+                    }
+                    // With one controller, its "Name AA:BB:…:" prefix on every line is just noise.
+                    let msg = match msg.split_once(": ") {
+                        Some((who, rest)) if strip_names && looks_like_device(who) && !who.starts_with("Pairing") => {
+                            rest.to_string()
+                        }
+                        _ if strip_names => strip_addresses(msg),
+                        _ => msg.to_string(),
+                    };
+                    let msg = msg.as_str();
+                    let lower = msg.to_lowercase();
+                    let col = if ["fail", "error", "lost", "refused", "without a working link", "isn't"]
+                        .iter()
+                        .any(|w| lower.contains(w))
+                    {
+                        BAD
+                    } else if lower.contains("disconnected") || lower.contains("turned off") {
+                        WARN
+                    } else if lower == "connected" || lower.contains("reconnected") || lower.contains("succeeded") {
+                        OK
+                    } else if lower.contains("pairing mode") || lower.contains("advertising") {
+                        ACCENT
+                    } else {
+                        alpha(TEXT, 170)
+                    };
+                    ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.add_sized([62.0, 14.0], egui::Label::new(mono(time, MUTED)));
+                        ui.add(egui::Label::new(mono(msg, col)).wrap_mode(egui::TextWrapMode::Wrap));
+                    });
+                }
+                if std::mem::take(jump_to_end) {
+                    ui.scroll_to_cursor(Some(Align::BOTTOM));
+                }
+            });
+        });
+}
+
+/// Replaces Bluetooth addresses ("78:86:2E:E1:D5:35") in a log line with "the controller", so
+/// sentences that use the address as a noun still read ("Pairing: the controller is in pairing mode").
+fn strip_addresses(msg: &str) -> String {
+    let b = msg.as_bytes();
+    let mut out = String::with_capacity(msg.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b.len() - i >= 17
+            && msg.is_char_boundary(i)
+            && msg.is_char_boundary(i + 17)
+            && looks_like_device(&msg[i..i + 17])
+        {
+            out.push_str("the controller");
+            i += 17;
+            continue;
+        }
+        let ch = msg[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// "Xbox Wireless Controller 78:86:2E:E1:D5:35": ends in a Bluetooth address.
+fn looks_like_device(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 17 && {
+        let mac = &b[b.len() - 17..];
+        (0..17).all(|i| if i % 3 == 2 { mac[i] == b':' } else { mac[i].is_ascii_hexdigit() })
+    }
+}
+
+/// Quieter, shorter button for Cancel / Dismiss, so it never competes with the main action.
+fn secondary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), egui::Sense::click());
+    let hot = resp.hovered();
+    ui.painter().rect(
+        rect,
+        6.0,
+        if hot { alpha(MUTED, 25) } else { egui::Color32::TRANSPARENT },
+        Stroke::new(1.0_f32, alpha(MUTED, if hot { 160 } else { 80 })),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label.to_uppercase(),
+        egui::FontId::monospace(10.0),
+        if hot { TEXT } else { MUTED },
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Full-width outlined button with a centred HUD label (and an external-link arrow if `arrow`).
+fn action_button(ui: &mut egui::Ui, label: &str, arrow: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), egui::Sense::click());
     let hot = resp.hovered();
     let p = ui.painter();
@@ -468,10 +813,12 @@ fn action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         other => other.into_layout_job(ui.style(), egui::FontSelection::Default, Align::Center).as_ref().clone(),
     });
     // Label centred as a group with the arrow; the arrow glyph sits low, so lift it slightly.
-    let arrow_w = 22.0;
+    let arrow_w = if arrow { 22.0 } else { 0.0 };
     let start = rect.center() - Vec2::new((galley.size().x + arrow_w) / 2.0, galley.size().y / 2.0);
     let arrow_at = egui::pos2(start.x + galley.size().x + arrow_w / 2.0 + 2.0, rect.center().y - 1.5);
     p.galley(start, galley, ACCENT);
-    p.text(arrow_at, egui::Align2::CENTER_CENTER, "↗", egui::FontId::proportional(12.0), ACCENT);
+    if arrow {
+        p.text(arrow_at, egui::Align2::CENTER_CENTER, "↗", egui::FontId::proportional(12.0), ACCENT);
+    }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }

@@ -96,11 +96,16 @@ pub fn hud(text: &str, size: f32, color: Color32) -> WidgetText {
 
 /// A dark card with a thin accent edge.
 pub fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    card_outlined(ui, alpha(ACCENT, 38), add);
+}
+
+/// A card with its own border colour, for one that should stand out (e.g. a task in progress).
+pub fn card_outlined(ui: &mut Ui, border: Color32, add: impl FnOnce(&mut Ui)) {
     // Inner width = outer width minus margins and stroke, so cards never push the panel wider.
     let inner = (ui.available_width() - 2.0 * 12.0 - 2.0).max(0.0);
     egui::Frame::new()
         .fill(CARD)
-        .stroke(Stroke::new(1.0_f32, alpha(ACCENT, 38)))
+        .stroke(Stroke::new(1.0_f32, border))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {

@@ -1,21 +1,27 @@
-//! Background thread that keeps every paired Xbox controller's Bluetooth LE link
-//! alive (GattSession.MaintainConnection) and reads battery / firmware over GATT.
+//! Background thread that keeps every paired Xbox controller's Bluetooth LE link alive and
+//! reads battery / firmware over GATT. Each controller gets one long-lived GattSession with
+//! MaintainConnection, plus an active reconnect loop while it's missing (see reconnect.rs).
 
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattCharacteristic, GattCharacteristicUuids, GattCommunicationStatus, GattDeviceService, GattServiceUuids,
-    GattSession, GattSessionStatus,
+    GattSession,
 };
-use windows::Devices::Bluetooth::{BluetoothCacheMode, BluetoothConnectionStatus, BluetoothLEDevice};
+use windows::Devices::Bluetooth::{BluetoothAdapter, BluetoothCacheMode, BluetoothConnectionStatus, BluetoothLEDevice};
 use windows::Devices::Enumeration::DeviceInformation;
+use windows::Devices::Radios::{Radio, RadioState};
 use windows::Storage::Streams::DataReader;
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+use windows::Win32::System::WindowsProgramming::{QueryInterruptTime, QueryUnbiasedInterruptTime};
 use windows::core::{Error, GUID, HSTRING, Result};
+
+use crate::reconnect::Reconnector;
+use crate::{events, pair};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Link {
@@ -32,6 +38,31 @@ pub struct CtrlInfo {
     pub link: Link,
     pub battery: Option<u8>,
     pub firmware: Option<String>,
+    /// The controller keeps connecting and getting refused before GATT works: it has most likely
+    /// forgotten this PC, and only re-pairing (its pair button) can fix that.
+    pub pairing_lost: bool,
+}
+
+/// Pairing progress, driven by the pairing thread and shown by the UI.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Repair {
+    #[default]
+    Idle,
+    /// The UI asked to (re-)pair this address (0 = any Xbox controller in pairing mode).
+    Requested(u64),
+    /// Waiting for the controller to be put in pairing mode; nothing has been changed yet.
+    Waiting,
+    Removing,
+    Pairing,
+    Done,
+    Failed(String),
+}
+
+impl Repair {
+    /// Something is in progress (as opposed to idle or showing a result).
+    pub fn busy(&self) -> bool {
+        !matches!(self, Repair::Idle | Repair::Done | Repair::Failed(_))
+    }
 }
 
 #[derive(Default)]
@@ -43,6 +74,16 @@ pub struct Shared {
     pub maintain: AtomicBool,
     pub autostart: AtomicBool,
     pub rescan: AtomicBool,
+    pub repair: Mutex<Repair>,
+    pub repair_cancel: AtomicBool,
+    /// A pairing job wants the keeper to let go of this controller (session and reconnects)...
+    pub release: Mutex<Option<u64>>,
+    /// ...and the keeper confirms here, once nothing of its own touches that address any more.
+    pub released: AtomicU64,
+    /// A pairing job just (re-)paired this address: forget any old pairing-loss evidence for it.
+    pub paired: AtomicU64,
+    /// The window is showing the Events tab, so input changes needn't trigger repaints.
+    pub events_tab: AtomicBool,
     /// Set when the window couldn't be created; the app keeps running tray-only.
     pub ui_failed: AtomicBool,
     /// Main window HWND (0 until the window exists, or if the UI failed to start).
@@ -71,28 +112,123 @@ pub fn spawn(shared: std::sync::Arc<Shared>) {
             *lock(&shared.error) = Some(format!("Windows Runtime failed to start: {e}"));
             return;
         }
-        Keeper { shared, ctrls: Vec::new(), firmware: Default::default(), next_scan: Instant::now(), backoff: 5 }.run();
+        Keeper {
+            shared,
+            ctrls: Vec::new(),
+            memory: HashMap::new(),
+            reconnectors: HashMap::new(),
+            next_scan: Instant::now(),
+            backoff: 5,
+            last_count: None,
+            radio: None,
+            radio_on: true,
+            next_radio: Instant::now(),
+        }
+        .run();
     });
+}
+
+/// What survives reopening a controller, so the UI doesn't flicker and pairing-loss evidence
+/// isn't thrown away by exactly the resets a bad pairing tends to cause.
+#[derive(Default, Clone)]
+struct Memory {
+    address: u64,
+    firmware: Option<String>,
+    refused: u32,
+    pairing_lost: bool,
 }
 
 struct Keeper {
     shared: std::sync::Arc<Shared>,
     ctrls: Vec<Ctrl>,
-    /// Firmware strings remembered across reopen, so the UI doesn't flicker.
-    firmware: std::collections::HashMap<String, String>,
+    memory: HashMap<String, Memory>,
+    reconnectors: HashMap<u64, Reconnector>,
     next_scan: Instant,
     backoff: u64,
+    last_count: Option<usize>,
+    radio: Option<Radio>,
+    radio_on: bool,
+    next_radio: Instant,
+}
+
+/// Suspend-aware clocks: interrupt time includes time spent asleep, unbiased time doesn't.
+fn clocks() -> (u64, u64) {
+    let mut unbiased = 0u64;
+    unsafe {
+        let _ = QueryUnbiasedInterruptTime(&mut unbiased);
+        (QueryInterruptTime(), unbiased)
+    }
 }
 
 impl Keeper {
     fn run(&mut self) {
+        events::log(format!("Xbox Connect v{} started", env!("CARGO_PKG_VERSION")));
+        let mut last = clocks();
         loop {
-            let now = Instant::now();
-            let forced = self.shared.rescan.swap(false, Ordering::Relaxed);
-            if forced || now >= self.next_scan {
+            // A pairing request from the UI: claim it here (so it's started exactly once) and run
+            // it on its own thread; this loop keeps serving the other controllers meanwhile.
+            {
+                let mut r = lock(&self.shared.repair);
+                if let Repair::Requested(addr) = *r {
+                    *r = Repair::Waiting;
+                    drop(r);
+                    pair::spawn(self.shared.clone(), addr);
+                }
+            }
+
+            // Sessions are held for as long as possible. Start over only when the Bluetooth stack
+            // itself went away: the radio was turned back on, or the PC was suspended.
+            let now = clocks();
+            let asleep = (now.0.saturating_sub(last.0)).saturating_sub(now.1.saturating_sub(last.1));
+            last = now;
+            if asleep > 50_000_000 {
+                // 100 ns units: more than 5 s spent suspended since the last pass.
+                self.reset("PC resumed from sleep");
+            } else if self.radio_turned_on() {
+                self.reset("Bluetooth turned back on");
+            }
+
+            let paired = self.shared.paired.swap(0, Ordering::AcqRel);
+            if paired != 0 {
+                self.memory.retain(|_, m| m.address != paired);
+                for c in self.ctrls.iter_mut().filter(|c| c.info.address == paired) {
+                    c.refused = 0;
+                    c.info.pairing_lost = false;
+                }
+            }
+
+            let released = *lock(&self.shared.release);
+            if let Some(addr) = released {
+                self.forget(|c| c.info.address == addr);
+            }
+
+            let maintain = self.shared.maintain.load(Ordering::Relaxed);
+            for c in &mut self.ctrls {
+                match c.tick(maintain) {
+                    Ok(()) => {
+                        c.errors = 0;
+                        c.last_error = None;
+                    }
+                    Err(e) => {
+                        let msg = e.message();
+                        if c.last_error.as_deref() != Some(msg.as_str()) {
+                            events::log(format!("{}: error: {msg}", c.label()));
+                            c.last_error = Some(msg);
+                        }
+                        c.errors += 1;
+                        c.drop_handles();
+                    }
+                }
+            }
+            // A controller that keeps failing, or can't get a session for 30s, may hold a stale
+            // device object (re-pairing keeps the same id); reopen it right away.
+            let stale =
+                |c: &Ctrl| c.errors >= 3 || c.no_session_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(30));
+            let forced = self.shared.rescan.swap(false, Ordering::Relaxed) | self.forget(stale);
+            if forced || Instant::now() >= self.next_scan {
                 // Back off 5s -> 60s while nothing is paired (or enumeration fails); once
                 // controllers are held, re-enumerate every 15s to pick up pairing changes.
-                self.backoff = match self.scan() {
+                self.backoff = match self.scan(released) {
                     Ok(0) | Err(_) => (self.backoff * 2).clamp(5, 60),
                     Ok(_) => 15,
                 };
@@ -100,47 +236,117 @@ impl Keeper {
                 self.shared.scanned.store(true, Ordering::Relaxed);
             }
 
-            let maintain = self.shared.maintain.load(Ordering::Relaxed);
-            for c in &mut self.ctrls {
-                match c.tick(maintain) {
-                    Ok(()) => c.errors = 0,
-                    Err(_) => {
-                        c.errors += 1;
-                        c.drop_handles();
-                    }
-                }
-            }
-            // A controller that keeps failing, or can't get a session for 30s, may hold a stale
-            // device object (re-pairing keeps the same id); reopen it on the next scan.
-            let before = self.ctrls.len();
-            let stale =
-                |c: &Ctrl| c.errors >= 3 || c.no_session_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(30));
-            for c in self.ctrls.iter().filter(|c| stale(c)) {
-                if let Some(fw) = &c.info.firmware {
-                    self.firmware.insert(c.info.id.clone(), fw.clone());
-                }
-            }
-            self.ctrls.retain(|c| !stale(c));
-            if self.ctrls.len() != before {
-                self.next_scan = Instant::now();
-            }
+            self.update_reconnectors(maintain, released);
             *lock(&self.shared.ctrls) = self.ctrls.iter().map(|c| c.info.clone()).collect();
             std::thread::sleep(Duration::from_secs(1));
         }
     }
 
+    /// Drops the matching controllers (closing their sessions), remembering what should survive.
+    /// Returns whether any were dropped.
+    fn forget(&mut self, which: impl Fn(&Ctrl) -> bool) -> bool {
+        let before = self.ctrls.len();
+        for c in self.ctrls.iter().filter(|c| which(c)) {
+            self.memory.insert(c.info.id.clone(), c.memory());
+        }
+        self.ctrls.retain(|c| !which(c));
+        self.ctrls.len() != before
+    }
+
+    /// Drops every controller and rescans right away.
+    fn reset(&mut self, why: &str) {
+        events::log(format!("{why}: reopening controllers"));
+        self.forget(|_| true);
+        // A fresh start for the stack is a fresh start for the pairing-loss verdict too.
+        for m in self.memory.values_mut() {
+            m.refused = 0;
+            m.pairing_lost = false;
+        }
+        for r in self.reconnectors.values() {
+            r.stop();
+        }
+        self.next_scan = Instant::now();
+    }
+
+    /// Keeps one reconnect loop running per controller that should be held but isn't connected.
+    /// Only for controllers with a keeper session (that session holds the link once it's up), and
+    /// only while the radio is on. One whose pairing looks lost is only probed slowly: it would
+    /// mostly just be refused, but a wrong verdict mustn't switch reconnecting off for good.
+    fn update_reconnectors(&mut self, maintain: bool, released: Option<u64>) {
+        let wanted: HashMap<u64, (String, bool)> = self
+            .ctrls
+            .iter()
+            .filter(|c| maintain && self.radio_on && c.session.is_some() && c.info.link != Link::Connected)
+            .map(|c| (c.info.address, (c.label(), c.info.pairing_lost)))
+            .collect();
+        self.reconnectors.retain(|addr, r| {
+            // Stop it if it's no longer wanted, or wanted at the other pace (restarted once done).
+            if wanted.get(addr).is_none_or(|(_, slow)| *slow != r.slow) {
+                r.stop();
+            }
+            !r.finished()
+        });
+        for (addr, (label, slow)) in wanted {
+            if !self.reconnectors.contains_key(&addr)
+                && let Some(r) = Reconnector::start(addr, label, slow)
+            {
+                self.reconnectors.insert(addr, r);
+            }
+        }
+        // Tell a waiting pairing job once nothing of ours touches its controller any more.
+        if let Some(addr) = released
+            && !self.reconnectors.contains_key(&addr)
+            && !self.ctrls.iter().any(|c| c.info.address == addr)
+        {
+            self.shared.released.store(addr, Ordering::Release);
+        }
+    }
+
+    /// True on the tick where the Bluetooth radio goes from off to on.
+    fn radio_turned_on(&mut self) -> bool {
+        if self.radio.is_none() && Instant::now() >= self.next_radio {
+            self.next_radio = Instant::now() + Duration::from_secs(30);
+            self.radio = (|| BluetoothAdapter::GetDefaultAsync()?.join()?.GetRadioAsync()?.join())().ok();
+        }
+        let Some(radio) = &self.radio else { return false };
+        match radio.State() {
+            Ok(state) => {
+                let on = state == RadioState::On;
+                let turned_on = on && !self.radio_on;
+                if on != self.radio_on && !on {
+                    events::log("Bluetooth turned off");
+                }
+                self.radio_on = on;
+                turned_on
+            }
+            Err(_) => {
+                self.radio = None;
+                false
+            }
+        }
+    }
+
     /// Re-enumerates paired controllers. A removed pairing disappears from the list; a re-paired
     /// controller keeps the same id, so `run` reopens devices that keep failing instead.
-    fn scan(&mut self) -> Result<usize> {
+    fn scan(&mut self, released: Option<u64>) -> Result<usize> {
         let ids = paired_controller_ids()?;
+        if self.last_count != Some(ids.len()) {
+            events::log(format!("{} paired controller(s)", ids.len()));
+            self.last_count = Some(ids.len());
+        }
         let keep: HashSet<&String> = ids.iter().collect();
-        self.ctrls.retain(|c| keep.contains(&c.info.id));
+        self.forget(|c| !keep.contains(&c.info.id));
         for id in &ids {
             if self.ctrls.iter().any(|c| &c.info.id == id) {
                 continue;
             }
             if let Ok(mut c) = Ctrl::open(id) {
-                c.info.firmware = self.firmware.get(id).cloned();
+                if released == Some(c.info.address) {
+                    continue; // a pairing job owns it right now
+                }
+                if let Some(m) = self.memory.get(id) {
+                    c.restore(m);
+                }
                 self.ctrls.push(c);
             }
         }
@@ -154,7 +360,7 @@ fn paired_controller_ids() -> Result<Vec<String>> {
     let mut ids = Vec::new();
     for i in 0..list.Size()? {
         let info = list.GetAt(i)?;
-        if info.Name()?.to_string().to_lowercase().contains("xbox") {
+        if info.Name().is_ok_and(|n| n.to_string().to_lowercase().contains("xbox")) {
             ids.push(info.Id()?.to_string());
         }
     }
@@ -174,7 +380,17 @@ struct Ctrl {
     firmware_fresh: bool,
     next_firmware: Instant,
     errors: u32,
+    last_error: Option<String>,
     no_session_since: Option<Instant>,
+    /// Link tracking for the log and for spotting a lost pairing.
+    was_connected: bool,
+    connected_at: Option<Instant>,
+    /// A GATT read worked during this connection, i.e. the link is encrypted and usable.
+    gatt_ok: bool,
+    /// A GATT read was tried during this connection and failed.
+    gatt_failed: bool,
+    /// Consecutive short connections where GATT was tried and never worked.
+    refused: u32,
 }
 
 impl Drop for Ctrl {
@@ -198,6 +414,7 @@ impl Ctrl {
             link: Link::Connecting,
             battery: None,
             firmware: None,
+            pairing_lost: false,
         };
         let now = Instant::now();
         Ok(Self {
@@ -213,8 +430,33 @@ impl Ctrl {
             firmware_fresh: false,
             next_firmware: now,
             errors: 0,
+            last_error: None,
             no_session_since: None,
+            was_connected: false,
+            connected_at: None,
+            gatt_ok: false,
+            gatt_failed: false,
+            refused: 0,
         })
+    }
+
+    fn memory(&self) -> Memory {
+        Memory {
+            address: self.info.address,
+            firmware: self.info.firmware.clone(),
+            refused: self.refused,
+            pairing_lost: self.info.pairing_lost,
+        }
+    }
+
+    fn restore(&mut self, m: &Memory) {
+        self.info.firmware = m.firmware.clone();
+        self.refused = m.refused;
+        self.info.pairing_lost = m.pairing_lost;
+    }
+
+    fn label(&self) -> String {
+        format!("{} {}", self.info.name, format_address(self.info.address))
     }
 
     /// Drop OS handles after an error; keep name/firmware so the UI doesn't flicker.
@@ -234,42 +476,68 @@ impl Ctrl {
         }
     }
 
+    fn gatt_worked(&mut self) {
+        if !self.gatt_ok {
+            self.gatt_ok = true;
+            self.refused = 0;
+            if self.info.pairing_lost {
+                self.info.pairing_lost = false;
+                events::log(format!("{}: pairing works again", self.label()));
+            }
+        }
+    }
+
+    fn track_link(&mut self, connected: bool, now: Instant) {
+        if connected == self.was_connected {
+            return;
+        }
+        self.was_connected = connected;
+        if connected {
+            self.connected_at = Some(now);
+            self.gatt_ok = false;
+            self.gatt_failed = false;
+            events::log(format!("{}: connected", self.label()));
+            return;
+        }
+        let held = self.connected_at.take().map_or(0, |t| now.duration_since(t).as_secs());
+        if self.gatt_failed && !self.gatt_ok && held < 30 {
+            // Windows reached the controller, GATT was tried and refused, and the controller hung
+            // up: the classic sign of it having dropped its pairing keys for this PC. (A short
+            // session where nothing was tried, e.g. switched off again quickly, doesn't count.)
+            self.refused += 1;
+            events::log(format!(
+                "{}: disconnected after {held}s without a working link ({} in a row)",
+                self.label(),
+                self.refused
+            ));
+            if self.refused >= 2 && !self.info.pairing_lost {
+                self.info.pairing_lost = true;
+                events::log(format!("{}: pairing looks lost; re-pair needed", self.label()));
+            }
+        } else {
+            events::log(format!("{}: disconnected after {held}s", self.label()));
+        }
+    }
+
     fn tick(&mut self, maintain: bool) -> Result<()> {
         let now = Instant::now();
 
         let connected = self.device.ConnectionStatus()? == BluetoothConnectionStatus::Connected;
+        self.track_link(connected, now);
 
-        // Keep exactly one session holding MaintainConnection at all times. A session can stop
-        // being Active after sleep/resume, an adapter reset, or simply while the pad is off; we
-        // then create a replacement *before* closing the old one, so there's never a gap where
-        // nothing asks Windows to reconnect. (Slower cadence while the pad is off.)
-        let status = match &self.session {
-            Some(s) => Some(s.SessionStatus()?),
-            None => None,
-        };
-        let replace = status != Some(GattSessionStatus::Active);
-        if replace && now >= self.next_session_try {
-            self.next_session_try = now + Duration::from_secs(if connected || status.is_none() { 5 } else { 15 });
-            // A failed replacement must not cost us the session we already have.
-            let fresh = (|| -> Result<GattSession> {
-                let s = GattSession::FromDeviceIdAsync(&self.device.BluetoothDeviceId()?)?.join()?;
-                if let Err(e) = s.SetMaintainConnection(maintain) {
-                    let _ = s.Close();
-                    return Err(e);
-                }
-                Ok(s)
-            })();
-            match fresh {
-                Ok(fresh) => {
-                    if let Some(old) = self.session.replace(fresh) {
-                        let _ = old.Close();
-                    }
-                    self.applied = Some(maintain);
-                }
-                // Only an error worth escalating if we have nothing holding the link.
-                Err(e) if self.session.is_none() => return Err(e),
-                Err(_) => {}
+        // Hold one session for the life of this device object. Its status reads Closed whenever
+        // the controller is off; it's never replaced just for that (reconnect.rs does the work).
+        if self.session.is_none() && now >= self.next_session_try {
+            self.next_session_try = now + Duration::from_secs(5);
+            let s = GattSession::FromDeviceIdAsync(&self.device.BluetoothDeviceId()?)?.join()?;
+            if let Err(e) = s.SetMaintainConnection(maintain) {
+                let _ = s.Close();
+                return Err(e);
             }
+            self.session = Some(s);
+            self.applied = Some(maintain);
+            let state = if maintain { "on" } else { "off" };
+            events::log(format!("{}: holding connection (auto-reconnect: {state})", self.label()));
         }
         if self.session.is_none() {
             self.no_session_since.get_or_insert(now);
@@ -301,10 +569,15 @@ impl Ctrl {
                     self.info.battery = Some(level.min(100));
                     self.battery_fails = 0;
                     self.next_battery = now + Duration::from_secs(60);
+                    self.gatt_worked();
                 }
                 Err(_) => {
                     // GATT is often not ready right after reconnecting: retry soon, then back
                     // off (5s, 10s, 20s, 40s, 60s) so a pad without the service isn't polled hard.
+                    // Only a failure once the link has had time to settle counts as a refusal.
+                    if self.connected_at.is_some_and(|t| now.duration_since(t) >= Duration::from_secs(5)) {
+                        self.gatt_failed = true;
+                    }
                     self.close_battery();
                     self.next_battery = now + Duration::from_secs((5u64 << self.battery_fails.min(4)).min(60));
                     self.battery_fails += 1;
@@ -319,6 +592,7 @@ impl Ctrl {
             if let Some(fw) = read_firmware(&self.device).ok().filter(|s| !s.is_empty()) {
                 self.info.firmware = Some(fw);
                 self.firmware_fresh = true;
+                self.gatt_worked();
             }
         }
         Ok(())
@@ -346,7 +620,7 @@ fn fail() -> Error {
 
 /// Service and characteristic discovery try the system cache first (no radio traffic) and fall
 /// back to an uncached lookup if the cache is empty or stale, e.g. right after re-pairing.
-fn open_service(dev: &BluetoothLEDevice, uuid: GUID) -> Result<GattDeviceService> {
+pub fn open_service(dev: &BluetoothLEDevice, uuid: GUID) -> Result<GattDeviceService> {
     let lookup = |mode| -> Result<GattDeviceService> {
         let r = dev.GetGattServicesForUuidWithCacheModeAsync(uuid, mode)?.join()?;
         if r.Status()? != GattCommunicationStatus::Success {
@@ -362,7 +636,7 @@ fn open_service(dev: &BluetoothLEDevice, uuid: GUID) -> Result<GattDeviceService
     lookup(BluetoothCacheMode::Cached).or_else(|_| lookup(BluetoothCacheMode::Uncached))
 }
 
-fn characteristic(svc: &GattDeviceService, uuid: GUID) -> Result<GattCharacteristic> {
+pub fn characteristic(svc: &GattDeviceService, uuid: GUID) -> Result<GattCharacteristic> {
     let lookup = |mode| -> Result<GattCharacteristic> {
         let r = svc.GetCharacteristicsForUuidWithCacheModeAsync(uuid, mode)?.join()?;
         if r.Status()? != GattCommunicationStatus::Success || r.Characteristics()?.Size()? == 0 {
@@ -373,7 +647,7 @@ fn characteristic(svc: &GattDeviceService, uuid: GUID) -> Result<GattCharacteris
     lookup(BluetoothCacheMode::Cached).or_else(|_| lookup(BluetoothCacheMode::Uncached))
 }
 
-fn read_value(ch: &GattCharacteristic) -> Result<Vec<u8>> {
+pub fn read_value(ch: &GattCharacteristic) -> Result<Vec<u8>> {
     let r = ch.ReadValueWithCacheModeAsync(BluetoothCacheMode::Uncached)?.join()?;
     if r.Status()? != GattCommunicationStatus::Success {
         return Err(fail());

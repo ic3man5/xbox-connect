@@ -1,0 +1,9 @@
+# Link the VC++ runtime statically but keep using the Universal CRT that ships with
+# Windows 10+ ("hybrid CRT"): no VCRUNTIME140.dll dependency, for only ~22 KB.
+# Note: a RUSTFLAGS environment variable overrides these.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-Ctarget-feature=+crt-static",
+    "-Clink-arg=/NODEFAULTLIB:libucrt.lib",
+    "-Clink-arg=/DEFAULTLIB:ucrt.lib",
+]

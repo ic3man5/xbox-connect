@@ -1,0 +1,79 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+
+# Least privilege by default; only the tag-gated release job gets write scopes.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml pins the exact compiler, so release sizes are reproducible.
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install
+          rustup component add clippy
+
+      - name: Lint
+        run: cargo clippy --release --locked -- -D warnings
+
+      # Remap build paths out of panic locations (smaller, and no runner paths in the binary).
+      # --config arrays merge with .cargo/config.toml (hybrid CRT flags).
+      - name: Build
+        shell: pwsh
+        run: |
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }
+          $q = { param($s) "'" + $s + "'" }   # TOML literal strings: no escaping of backslashes
+          "[target.x86_64-pc-windows-msvc]`nrustflags = [$(& $q "--remap-path-prefix=$env:GITHUB_WORKSPACE=."), $(& $q "--remap-path-prefix=$cargoHome=cargo")]" |
+            Set-Content -Encoding utf8 remap.toml
+          cargo build --release --locked --config remap.toml
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $exe = 'target/release/xbox-connect.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "$hash  xbox-connect.exe" | Set-Content -NoNewline "$exe.sha256"
+          "Binary size: $((Get-Item $exe).Length / 1KB) KB"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xbox-connect
+          path: |
+            target/release/xbox-connect.exe
+            target/release/xbox-connect.exe.sha256
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: xbox-connect
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: xbox-connect.exe
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" xbox-connect.exe xbox-connect.exe.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

@@ -1,0 +1,16 @@
+Source: "Gamepad Line Art Pack" by gidedin — https://gidedin.itch.io/gamepad-line-art-pack
+File used: svg/regular/xbox-series.svg (unmodified)
+
+Gamepad Line Art Pack
+
+To the extent possible under law, the author has waived all copyright and related or neighboring
+rights to this work, under the CC0 1.0 Universal Public Domain Dedication.
+
+You can copy, modify, distribute and use the work, even for commercial purposes, all without
+asking permission.
+
+Full legal text: https://creativecommons.org/publicdomain/zero/1.0/legalcode
+
+This dedication covers the drawings only. It grants no rights in any trademark. Xbox, PlayStation,
+DualShock, DualSense, Nintendo Switch and Joy-Con are trademarks of their respective owners, and
+this work is not affiliated with, sponsored by or endorsed by them.

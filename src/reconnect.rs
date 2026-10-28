@@ -6,6 +6,9 @@
 //! missing we keep exactly one explicit connect pending at all times — an uncached GATT discovery,
 //! which Windows serves by trying to connect (~7.7 s per try) — the way Linux keeps an LE
 //! connection pending for bonded HID devices. Verified: a single power-on connects in seconds.
+//!
+//! That keeps the radio busy, and on combo Wi-Fi/Bluetooth chips it can cost ping, so the user can
+//! have it slow down or pause while a fullscreen game runs.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +17,9 @@ use std::time::{Duration, Instant};
 use windows::Devices::Bluetooth::GenericAttributeProfile::GattCommunicationStatus;
 use windows::Devices::Bluetooth::{BluetoothCacheMode, BluetoothConnectionStatus, BluetoothLEDevice};
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+use windows::Win32::UI::Shell::{QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
 
+use crate::bt::{Fullscreen, Shared};
 use crate::events;
 
 /// Handle to one controller's reconnect thread. There is at most one per controller: the keeper
@@ -27,14 +32,14 @@ pub struct Reconnector {
 }
 
 impl Reconnector {
-    pub fn start(addr: u64, label: String, slow: bool) -> Option<Self> {
+    pub fn start(addr: u64, label: String, slow: bool, shared: Arc<Shared>) -> Option<Self> {
         let want = Arc::new(AtomicBool::new(true));
         let done = Arc::new(AtomicBool::new(false));
         let (w, d) = (want.clone(), done.clone());
         std::thread::Builder::new()
             .name("reconnect".into())
             .spawn(move || {
-                run(addr, &label, &w, slow);
+                run(addr, &label, &w, slow, &shared);
                 d.store(true, Ordering::Release);
             })
             .ok()?;
@@ -51,7 +56,21 @@ impl Reconnector {
     }
 }
 
-fn run(addr: u64, label: &str, want: &AtomicBool, slow: bool) {
+/// A game (or other app) is running fullscreen: exclusive (D3D) or borderless/presentation mode.
+fn fullscreen_app() -> bool {
+    fullscreen_kind().is_some()
+}
+
+/// Which kind of fullscreen app is running, if any (for the log).
+pub fn fullscreen_kind() -> Option<&'static str> {
+    match unsafe { SHQueryUserNotificationState() } {
+        Ok(QUNS_RUNNING_D3D_FULL_SCREEN) => Some("exclusive fullscreen"),
+        Ok(QUNS_BUSY) => Some("borderless fullscreen or presentation"),
+        _ => None,
+    }
+}
+
+fn run(addr: u64, label: &str, want: &AtomicBool, slow: bool, shared: &Shared) {
     let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
     let Ok(dev) = BluetoothLEDevice::FromBluetoothAddressAsync(addr).and_then(|op| op.join()) else {
         return; // the keeper starts another on its next pass
@@ -59,32 +78,52 @@ fn run(addr: u64, label: &str, want: &AtomicBool, slow: bool) {
     let started = Instant::now();
     let mut tries = 0u32;
     let mut reported = false;
+    let mut next = Instant::now(); // when the next attempt may start
+    let mut gaming = Fullscreen::Normal; // what the fullscreen setting is doing right now
     if slow {
         events::log(format!("{label}: retrying once a minute (pairing looks lost)"));
     } else {
         events::log(format!("{label}: reconnecting (waiting for the controller to turn on)"));
     }
     while want.load(Ordering::Relaxed) {
-        // A pad that looks unpaired is still probed now and then, so a wrong verdict can't
-        // switch reconnecting off for good, but it isn't hammered with refused connects.
-        if slow && tries > 0 {
-            for _ in 0..60 {
-                if !want.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            if !want.load(Ordering::Relaxed) {
-                break;
-            }
-        }
         if dev.ConnectionStatus().is_ok_and(|s| s == BluetoothConnectionStatus::Connected) {
             let secs = started.elapsed().as_secs();
             events::log(format!("{label}: reconnected after {secs}s ({tries} attempts)"));
             break;
         }
+
+        // The fullscreen setting, applied only while a fullscreen app is actually running.
+        let setting = Fullscreen::from_u8(shared.fullscreen.load(Ordering::Relaxed));
+        let now_gaming = if setting != Fullscreen::Normal && fullscreen_app() { setting } else { Fullscreen::Normal };
+        if now_gaming != gaming {
+            events::log(match now_gaming {
+                Fullscreen::Pause => format!("{label}: fullscreen game running; reconnecting paused"),
+                Fullscreen::Slow => format!("{label}: fullscreen game running; reconnecting every 20s"),
+                Fullscreen::Normal => {
+                    next = Instant::now(); // back to normal: try straight away
+                    if setting == Fullscreen::Normal {
+                        format!("{label}: fullscreen setting changed; reconnecting normally")
+                    } else {
+                        format!("{label}: fullscreen ended; reconnecting normally")
+                    }
+                }
+            });
+            gaming = now_gaming;
+        }
+
+        let now = Instant::now();
+        if gaming == Fullscreen::Pause || now < next {
+            // Wait in short steps, so stopping, a setting change or the game ending is seen quickly.
+            let step = if gaming == Fullscreen::Pause {
+                Duration::from_secs(1) // stay quiet while the game runs
+            } else {
+                next.saturating_duration_since(now).clamp(Duration::from_millis(100), Duration::from_secs(1))
+            };
+            std::thread::sleep(step);
+            continue;
+        }
+
         tries += 1;
-        let attempt = Instant::now();
         let status = dev.GetGattServicesWithCacheModeAsync(BluetoothCacheMode::Uncached).and_then(|op| op.join());
         match status.and_then(|r| r.Status()) {
             // Unreachable is the normal "nobody answered" outcome while the pad is off.
@@ -100,11 +139,17 @@ fn run(addr: u64, label: &str, want: &AtomicBool, slow: bool) {
                 }
             }
         }
-        // An attempt normally takes ~7.7 s; one that comes back at once (adapter gone, Windows
-        // failing fast) mustn't turn this into a busy loop.
-        if let Some(rest) = Duration::from_secs(2).checked_sub(attempt.elapsed()) {
-            std::thread::sleep(rest);
-        }
+        // Normally the next attempt follows at once (each takes ~7.7 s), but never sooner than 2 s
+        // after the last one started (one that fails instantly mustn't become a busy loop). A pad
+        // whose pairing looks lost is probed once a minute; "slow down" while gaming, every 20 s.
+        let gap = if slow {
+            60
+        } else if gaming == Fullscreen::Slow {
+            20
+        } else {
+            2
+        };
+        next = now + Duration::from_secs(gap);
     }
     let _ = dev.Close();
 }

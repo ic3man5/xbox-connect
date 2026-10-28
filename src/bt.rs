@@ -3,7 +3,7 @@
 //! MaintainConnection, plus an active reconnect loop while it's missing (see reconnect.rs).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows::Win32::System::WindowsProgramming::{QueryInterruptTime, QueryUnbiasedInterruptTime};
 use windows::core::{Error, GUID, HSTRING, Result};
 
-use crate::reconnect::Reconnector;
+use crate::reconnect::{self, Reconnector};
 use crate::{events, pair};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,8 +65,41 @@ impl Repair {
     }
 }
 
+/// What reconnecting does while a fullscreen game runs (stored as a u8 in `Shared::fullscreen`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fullscreen {
+    /// Keep reconnecting as usual.
+    Normal = 0,
+    /// One attempt every 20 s, to keep the shared Wi-Fi/Bluetooth radio mostly free.
+    Slow = 1,
+    /// No attempts until the game leaves fullscreen.
+    Pause = 2,
+}
+
+impl Fullscreen {
+    pub const ALL: [Fullscreen; 3] = [Fullscreen::Normal, Fullscreen::Slow, Fullscreen::Pause];
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Fullscreen::Slow,
+            2 => Fullscreen::Pause,
+            _ => Fullscreen::Normal,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Fullscreen::Normal => "Keep reconnecting",
+            Fullscreen::Slow => "Slow down",
+            Fullscreen::Pause => "Pause",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Shared {
+    /// `Fullscreen` setting, as its u8 value.
+    pub fullscreen: AtomicU8,
     pub ctrls: Mutex<Vec<CtrlInfo>>,
     pub error: Mutex<Option<String>>,
     /// Set once the first scan has finished, so the UI can tell "none paired" from "still looking".
@@ -164,6 +197,7 @@ impl Keeper {
     fn run(&mut self) {
         events::log(format!("Xbox Connect v{} started", env!("CARGO_PKG_VERSION")));
         let mut last = clocks();
+        let mut fullscreen: Option<&str> = None;
         loop {
             // A pairing request from the UI: claim it here (so it's started exactly once) and run
             // it on its own thread; this loop keeps serving the other controllers meanwhile.
@@ -186,6 +220,17 @@ impl Keeper {
                 self.reset("PC resumed from sleep");
             } else if self.radio_turned_on() {
                 self.reset("Bluetooth turned back on");
+            }
+
+            // Note fullscreen apps starting and stopping, whatever the controllers are doing, so
+            // it's easy to check that a given game is detected (see "During fullscreen games").
+            let kind = reconnect::fullscreen_kind();
+            if kind != fullscreen {
+                events::log(match kind {
+                    Some(k) => format!("Fullscreen app started ({k})"),
+                    None => "Fullscreen app ended".to_string(),
+                });
+                fullscreen = kind;
             }
 
             let paired = self.shared.paired.swap(0, Ordering::AcqRel);
@@ -288,7 +333,7 @@ impl Keeper {
         });
         for (addr, (label, slow)) in wanted {
             if !self.reconnectors.contains_key(&addr)
-                && let Some(r) = Reconnector::start(addr, label, slow)
+                && let Some(r) = Reconnector::start(addr, label, slow, self.shared.clone())
             {
                 self.reconnectors.insert(addr, r);
             }

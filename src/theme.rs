@@ -114,6 +114,99 @@ pub fn card_outlined(ui: &mut Ui, border: Color32, add: impl FnOnce(&mut Ui)) {
         });
 }
 
+/// A settings choice: the label (styled like a toggle's) over a full-width selector showing the
+/// current option; clicking opens the list. Returns the index picked this frame, if any.
+pub fn dropdown(ui: &mut Ui, label: &str, current: usize, options: &[(&str, &str)]) -> Option<usize> {
+    let enabled = ui.is_enabled();
+    let text = |s: &str, size: f32, color: Color32| {
+        let mut job = LayoutJob::default();
+        job.append(
+            &s.to_uppercase(),
+            0.0,
+            TextFormat {
+                font_id: FontId::new(size, FontFamily::Monospace),
+                color,
+                extra_letter_spacing: size * 0.15,
+                ..Default::default()
+            },
+        );
+        job
+    };
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), Sense::hover());
+    let g = ui.painter().layout_job(text(label, 11.0, alpha(TEXT, if enabled { 218 } else { 110 })));
+    ui.painter().galley(egui::pos2(row.left(), row.center().y - g.size().y / 2.0), g, TEXT);
+
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
+    let hot = resp.hovered() && enabled;
+    let p = ui.painter();
+    p.rect(
+        rect,
+        6.0,
+        WELL,
+        Stroke::new(1.0_f32, if hot { ACCENT } else { alpha(ACCENT, if enabled { 90 } else { 35 }) }),
+        StrokeKind::Inside,
+    );
+    let col = if enabled { ACCENT } else { DIM };
+    let g = p.layout_job(text(options.get(current).map_or("", |o| o.0), 10.0, col));
+    p.galley(egui::pos2(rect.left() + 10.0, rect.center().y - g.size().y / 2.0), g, col);
+    p.text(
+        egui::pos2(rect.right() - 12.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        "▾",
+        FontId::proportional(12.0),
+        col,
+    );
+
+    // The list, drawn in the HUD style rather than egui's stock menu: a card-coloured panel, rows
+    // that light up on hover, and an accent bar marking the current choice.
+    let mut picked = None;
+    let frame = egui::Frame::new()
+        .fill(CARD)
+        .stroke(Stroke::new(1.0_f32, alpha(ACCENT, 90)))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::same(4));
+    egui::Popup::menu(&resp).width(rect.width()).gap(4.0).frame(frame).show(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        for (i, (name, about)) in options.iter().enumerate() {
+            let on = i == current;
+            let (row, r) = ui.allocate_exact_size(Vec2::new(rect.width() - 8.0, 40.0), Sense::click());
+            let p = ui.painter();
+            if r.hovered() && enabled {
+                p.rect_filled(row, 4.0, alpha(ACCENT, 28));
+            }
+            if on {
+                p.rect_filled(
+                    egui::Rect::from_min_size(
+                        row.left_top() + Vec2::new(0.0, 6.0),
+                        Vec2::new(2.0, row.height() - 12.0),
+                    ),
+                    1.0,
+                    ACCENT,
+                );
+            }
+            let g = p.layout_job(text(name, 10.0, if on { ACCENT } else { TEXT }));
+            let name_h = g.size().y;
+            p.galley(egui::pos2(row.left() + 10.0, row.top() + 7.0), g, TEXT);
+            let mut job = LayoutJob::single_section(
+                about.to_string(),
+                TextFormat { font_id: FontId::proportional(11.0), color: MUTED, ..Default::default() },
+            );
+            job.wrap.max_width = row.width() - 16.0;
+            job.wrap.max_rows = 1; // one line; the selector's width is the list's width
+            p.galley(egui::pos2(row.left() + 10.0, row.top() + 9.0 + name_h), p.layout_job(job), MUTED);
+            // A pick made while the control is disabled (e.g. switched off from the tray) is ignored.
+            // The full description on hover, in case a longer one is ever cut to fit.
+            if r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(*about).clicked() && enabled {
+                picked = Some(i);
+                ui.close();
+            }
+        }
+    });
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_disabled_hover_text("Only applies while Auto-reconnect is on.");
+    picked
+}
+
 /// Pill toggle switch with a glowing knob.
 pub fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let size = Vec2::new(ui.available_width(), 26.0);

@@ -12,6 +12,7 @@ const RUN_KEY: windows::core::PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVe
 const RUN_VALUE: windows::core::PCWSTR = w!("XboxConnect");
 const APP_KEY: windows::core::PCWSTR = w!(r"Software\XboxConnect");
 const KEEP_VALUE: windows::core::PCWSTR = w!("KeepConnected");
+const FULLSCREEN_VALUE: windows::core::PCWSTR = w!("FullscreenMode");
 
 fn run_command() -> Option<String> {
     Some(format!("\"{}\" --minimized", std::env::current_exe().ok()?.display()))
@@ -77,27 +78,42 @@ pub fn heal_autostart() {
     }
 }
 
-pub fn keep_connected() -> bool {
-    let mut v = 1u32;
+fn read_dword(value: windows::core::PCWSTR, default: u32) -> u32 {
+    let mut v = default;
     let mut len = 4u32;
-    unsafe {
-        let _ = RegGetValueW(
+    let rc = unsafe {
+        RegGetValueW(
             HKEY_CURRENT_USER,
             APP_KEY,
-            KEEP_VALUE,
+            value,
             RRF_RT_REG_DWORD,
             None,
             Some((&mut v as *mut u32).cast()),
             Some(&mut len),
-        );
+        )
+    };
+    if rc == ERROR_SUCCESS { v } else { default }
+}
+
+fn write_dword(value: windows::core::PCWSTR, v: u32) {
+    unsafe {
+        let _ = RegSetKeyValueW(HKEY_CURRENT_USER, APP_KEY, value, REG_DWORD.0, Some((&v as *const u32).cast()), 4);
     }
-    v != 0
+}
+
+pub fn keep_connected() -> bool {
+    read_dword(KEEP_VALUE, 1) != 0
 }
 
 pub fn set_keep_connected(on: bool) {
-    let v = on as u32;
-    unsafe {
-        let _ =
-            RegSetKeyValueW(HKEY_CURRENT_USER, APP_KEY, KEEP_VALUE, REG_DWORD.0, Some((&v as *const u32).cast()), 4);
-    }
+    write_dword(KEEP_VALUE, on as u32);
+}
+
+/// What reconnecting does while a fullscreen game runs (see `bt::Fullscreen`).
+pub fn fullscreen_mode() -> u8 {
+    read_dword(FULLSCREEN_VALUE, 0).min(2) as u8
+}
+
+pub fn set_fullscreen_mode(mode: u8) {
+    write_dword(FULLSCREEN_VALUE, mode as u32);
 }

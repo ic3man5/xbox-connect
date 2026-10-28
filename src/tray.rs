@@ -4,14 +4,14 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, GetSystemMetrics, MSG, SM_CXSMICON, SetTimer, TranslateMessage,
 };
 
-use crate::bt::{Link, Shared, lock};
+use crate::bt::{Fullscreen, Link, Shared, lock};
 use crate::{APP_NAME, icon, settings, show_window};
 
 pub fn spawn(shared: Arc<Shared>) {
@@ -65,6 +65,13 @@ fn run(shared: Arc<Shared>) {
     }
     let show = MenuItem::new("Show", true, None);
     let keep = CheckMenuItem::new("Auto-reconnect", true, shared.maintain.load(Ordering::Relaxed), None);
+    // "During fullscreen games": one check item per choice, kept exclusive like radio items.
+    let modes: Vec<CheckMenuItem> =
+        Fullscreen::ALL.iter().map(|m| CheckMenuItem::new(m.label(), true, false, None)).collect();
+    let gaming = Submenu::new("During fullscreen games", true);
+    for m in &modes {
+        let _ = gaming.append(m);
+    }
     let startup = CheckMenuItem::new("Start with Windows", true, shared.autostart.load(Ordering::Relaxed), None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
@@ -72,6 +79,7 @@ fn run(shared: Arc<Shared>) {
         &show,
         &PredefinedMenuItem::separator(),
         &keep,
+        &gaming,
         &startup,
         &PredefinedMenuItem::separator(),
         &quit,
@@ -111,6 +119,10 @@ fn run(shared: Arc<Shared>) {
                 let on = keep.is_checked();
                 shared.maintain.store(on, Ordering::Relaxed);
                 settings::set_keep_connected(on);
+            } else if let Some(i) = modes.iter().position(|m| m.id() == &ev.id) {
+                let mode = Fullscreen::ALL[i] as u8;
+                shared.fullscreen.store(mode, Ordering::Relaxed);
+                settings::set_fullscreen_mode(mode);
             } else if ev.id == startup.id() {
                 let on = startup.is_checked();
                 if settings::set_autostart(on).is_ok() {
@@ -125,7 +137,13 @@ fn run(shared: Arc<Shared>) {
         }
 
         // Keep menu checks in sync with changes made in the window.
-        keep.set_checked(shared.maintain.load(Ordering::Relaxed));
+        let maintain = shared.maintain.load(Ordering::Relaxed);
+        keep.set_checked(maintain);
+        gaming.set_enabled(maintain); // it only changes what auto-reconnect does
+        let mode = shared.fullscreen.load(Ordering::Relaxed) as usize;
+        for (i, m) in modes.iter().enumerate() {
+            m.set_checked(i == mode);
+        }
         startup.set_checked(shared.autostart.load(Ordering::Relaxed));
 
         // Redraw on a status change, or when the display scaling (and so the icon size) changed.

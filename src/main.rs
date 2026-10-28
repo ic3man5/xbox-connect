@@ -30,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, w};
 
-use bt::{CtrlInfo, Link, Repair, Shared, format_address};
+use bt::{CtrlInfo, Fullscreen, Link, Repair, Shared, format_address};
 use theme::*;
 pub const APP_NAME: &str = "Xbox Connect";
 
@@ -141,6 +141,7 @@ fn main() {
 
     let shared = Arc::new(Shared::default());
     shared.maintain.store(settings::keep_connected(), Ordering::Relaxed);
+    shared.fullscreen.store(settings::fullscreen_mode(), Ordering::Relaxed);
     shared.autostart.store(settings::autostart_enabled(), Ordering::Relaxed);
     // Keep-alive and tray don't depend on the UI, so they survive a graphics failure.
     bt::spawn(shared.clone());
@@ -320,10 +321,6 @@ impl App {
 
 impl App {
     fn side_panel(&mut self, ui: &mut egui::Ui, ctrls: &[CtrlInfo], pad: &pad::Pad) {
-        ui.label(hud("Xbox Connect", 13.0, ACCENT));
-        ui.label(hud("Bluetooth keep-alive", 9.0, MUTED));
-        ui.add_space(10.0);
-
         if let Some(err) = bt::lock(&self.shared.error).clone() {
             card(ui, |ui| {
                 ui.label(RichText::new(err).color(BAD));
@@ -434,14 +431,22 @@ impl App {
                         Some(_) => ACCENT,
                         None => DIM,
                     };
-                    ui.label(
-                        RichText::new(battery.map_or("--".to_string(), |b| format!("{b}%")))
-                            .size(34.0)
-                            .family(egui::FontFamily::Monospace)
-                            .color(col),
+                    // Percentage and segmented gauge on one row: the number at a fixed width (so the
+                    // gauge doesn't shift as it changes), the gauge filling the rest.
+                    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), egui::Sense::hover());
+                    let text = battery.map_or("--".to_string(), |b| format!("{b}%"));
+                    ui.painter().text(
+                        row.left_center(),
+                        egui::Align2::LEFT_CENTER,
+                        text,
+                        egui::FontId::monospace(24.0),
+                        col,
                     );
-                    // Segmented gauge.
-                    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 10.0), egui::Sense::hover());
+                    let number_w = 72.0; // "100%" at 24 pt mono
+                    let r = egui::Rect::from_min_max(
+                        egui::pos2(row.left() + number_w, row.center().y - 5.0),
+                        egui::pos2(row.right(), row.center().y + 5.0),
+                    );
                     let n = 12;
                     let gap = 3.0;
                     let w = (r.width() - gap * (n as f32 - 1.0)) / n as f32;
@@ -518,6 +523,22 @@ impl App {
             self.shared.maintain.store(keep, Ordering::Relaxed);
             settings::set_keep_connected(keep);
         }
+        // Only meaningful while auto-reconnect is on (that's what it slows down or pauses).
+        ui.add_space(4.0);
+        ui.add_enabled_ui(keep, |ui| {
+            let current = self.shared.fullscreen.load(Ordering::Relaxed) as usize;
+            let options = [
+                (Fullscreen::Normal.label(), "No change."),
+                (Fullscreen::Slow.label(), "Every 20 s; may connect slower."),
+                (Fullscreen::Pause.label(), "Paused until you leave the game."),
+            ];
+            if let Some(i) = dropdown(ui, "During fullscreen games", current, &options) {
+                let mode = Fullscreen::ALL[i] as u8;
+                self.shared.fullscreen.store(mode, Ordering::Relaxed);
+                settings::set_fullscreen_mode(mode);
+            }
+        });
+        ui.add_space(4.0);
         let mut auto = self.shared.autostart.load(Ordering::Relaxed);
         if toggle(ui, &mut auto, "Start with Windows").changed() && settings::set_autostart(auto).is_ok() {
             self.shared.autostart.store(auto, Ordering::Relaxed);
